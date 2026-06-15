@@ -1,0 +1,23 @@
+{
+  "name": "k8s-observability-app",
+  "version": "1.0.0",
+  "description": "Production Node.js app with Prometheus metrics",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest --forceExit --coverage",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "express": "4.18.2",
+    "prom-client": "15.1.0"
+  },
+  "devDependencies": {
+    "jest": "29.7.0",
+    "supertest": "6.3.4",
+    "eslint": "8.57.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
