@@ -448,7 +448,7 @@ curl -s http://localhost:3000/metrics | grep http_requests_total
 docker stop obs-app-test && docker rm obs-app-test
 ```
 
-### Step 4: Verify graceful shutdown
+### Step 4: Verify graceful shutdowm.
 
 ```bash
 # Run interactively to watch signal handling
