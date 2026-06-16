@@ -1,0 +1,345 @@
+
+pipeline {
+
+  agent any
+
+  environment {
+    // ---- Registry Configuration ----
+    NEXUS_HOST           = '172.31.35.237'
+    NEXUS_DOCKER_PORT    = '8082'
+    NEXUS_REGISTRY       = "${NEXUS_HOST}:${NEXUS_DOCKER_PORT}"
+
+    // ---- Image Naming ----
+    IMAGE_NAME           = 'k8s-obs-app'
+    // Full image path including registry prefix
+    IMAGE_FULL           = "${NEXUS_REGISTRY}/${IMAGE_NAME}"
+
+    // ---- Kubernetes Deployment Target ----
+    K8S_NAMESPACE        = 'app-production'
+    K8S_DEPLOYMENT_NAME  = 'k8s-obs-app'
+
+    // The actual secret values are injected by withCredentials() blocks.
+    NEXUS_CRED_ID        = 'nexus-docker-credentials'
+    KUBECONFIG_CRED_ID   = 'k8s-kubeconfig'
+
+    // BUILD_NUMBER is a built-in Jenkins variable (auto-incrementing integer)
+    // That will help in Troubleshooting.
+    GIT_COMMIT_SHORT     = sh(script: "git rev-parse --short HEAD 2>/dev/null || echo 'unknown'", returnStdout: true).trim()
+    BUILD_TAG            = "${env.BUILD_NUMBER}-${GIT_COMMIT_SHORT}"
+
+    // ---- Trivy Scan Configuration ----
+    // EXIT_CODE=1: Fail the build on CRITICAL vulnerabilities
+    TRIVY_SEVERITY       = 'CRITICAL'
+    TRIVY_EXIT_CODE      = '1'
+  }
+
+
+  options {
+    // Abort the build if it runs longer than 30 minutes total
+    timeout(time: 30, unit: 'MINUTES')
+
+    // Prefix all console output with timestamps — essential for debugging
+    timestamps()
+
+    // Color ANSI codes in output (requires AnsiColor plugin, optional)
+    // ansiColor('xterm')
+
+    // Don't run concurrent builds of the same pipeline
+    // Prevents race conditions during deploy
+    disableConcurrentBuilds()
+
+    // Keep build artifacts and logs for last 10 successful builds, 20 total
+    buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
+  }
+
+  stages {
+
+    // =========================================================================
+    // STAGE 1: Checkout
+    // What: Fetch the latest code from the configured SCM branch
+    // Why: Ensures we're always building from the canonical source of truth
+    // =========================================================================
+    stage('1. Checkout Code') {
+      steps {
+        // The declarative 'checkout scm' directive checks out the branch/commit
+        // that triggered this build. It also sets GIT_COMMIT, GIT_BRANCH, etc.
+        checkout scm
+
+        // Print build context for log clarity
+        sh '''
+          echo "=========================================="
+          echo "  BUILD CONTEXT"
+          echo "=========================================="
+          echo "  Jenkins Build Number : ${BUILD_NUMBER}"
+          echo "  Build Tag            : ${BUILD_TAG}"
+          echo "  Git Branch           : ${GIT_BRANCH}"
+          echo "  Git Commit (short)   : ${GIT_COMMIT_SHORT}"
+          echo "  Workspace            : ${WORKSPACE}"
+          echo "  Target Registry      : ${NEXUS_REGISTRY}"
+          echo "  Target Image         : ${IMAGE_FULL}"
+          echo "  K8s Namespace        : ${K8S_NAMESPACE}"
+          echo "=========================================="
+        '''
+      }
+    }
+
+    // STAGE 2: Docker Build
+    // Build the Docker image using our multi-stage Dockerfile
+    stage('2. Docker Build') {
+      steps {
+        script {
+          echo "Building Docker image: ${IMAGE_FULL}:${BUILD_TAG}"
+
+          env.DOCKER_BUILD_IMAGE = "${IMAGE_FULL}:${BUILD_TAG}"
+
+          sh """
+            docker build \\
+              --file docker/Dockerfile \\
+              --tag ${IMAGE_FULL}:${BUILD_TAG} \\
+              --tag ${IMAGE_FULL}:latest \\
+              --build-arg BUILDKIT_INLINE_CACHE=1 \\
+              --label "build.number=${BUILD_NUMBER}" \\
+              --label "build.commit=${GIT_COMMIT_SHORT}" \\
+              --label "build.branch=${GIT_BRANCH}" \\
+              --label "build.timestamp=\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
+              .
+          """
+
+          // Verify the image was created
+          sh "docker images ${IMAGE_FULL}:${BUILD_TAG}"
+
+          // Quick smoke test: start the container, check /healthz, stop it
+          // This catches failures where the image builds but the app crashes at startup
+          sh """
+            echo "--- Running post-build smoke test ---"
+            docker run -d \\
+              --name smoke-test-${BUILD_NUMBER} \\
+              --env APP_VERSION=smoke-test \\
+              --env BUILD_NUMBER=${BUILD_NUMBER} \\
+              --publish 13000:3000 \\
+              ${IMAGE_FULL}:${BUILD_TAG}
+
+            # Wait for startup
+            sleep 8
+
+            # Test /healthz endpoint
+            HTTP_STATUS=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:13000/healthz)
+            if [ "\${HTTP_STATUS}" != "200" ]; then
+              echo "SMOKE TEST FAILED: /healthz returned HTTP \${HTTP_STATUS}"
+              docker logs smoke-test-${BUILD_NUMBER}
+              docker stop smoke-test-${BUILD_NUMBER}
+              docker rm  smoke-test-${BUILD_NUMBER}
+              exit 1
+            fi
+            echo "SMOKE TEST PASSED: /healthz returned 200"
+
+            # Test /metrics endpoint
+            HTTP_STATUS=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:13000/metrics)
+            if [ "\${HTTP_STATUS}" != "200" ]; then
+              echo "SMOKE TEST FAILED: /metrics returned HTTP \${HTTP_STATUS}"
+              docker stop smoke-test-${BUILD_NUMBER}
+              docker rm  smoke-test-${BUILD_NUMBER}
+              exit 1
+            fi
+            echo "SMOKE TEST PASSED: /metrics returned 200"
+
+            # Clean up smoke test container
+            docker stop smoke-test-${BUILD_NUMBER}
+            docker rm  smoke-test-${BUILD_NUMBER}
+            echo "--- Smoke test complete ---"
+          """
+        }
+      }
+    }
+
+    // STAGE 3: Vulnerability Scan (Trivy)
+    // Scan the built image for known CVEs before pushing anywhere==
+    stage('3. Vulnerability Scan (Trivy)') {
+      steps {
+        script {
+          echo "Scanning image for vulnerabilities: ${IMAGE_FULL}:${BUILD_TAG}"
+
+          // Ensure Trivy DB is up to date (cache in /tmp for Jenkins agent reuse)
+          sh "trivy image --download-db-only --cache-dir /tmp/trivy-cache"
+
+          // Scan 1: Table output for human-readable log
+          sh """
+            trivy image \\
+              --cache-dir /tmp/trivy-cache \\
+              --format table \\
+              --exit-code 0 \\
+              --severity HIGH,CRITICAL \\
+              --no-progress \\
+              ${IMAGE_FULL}:${BUILD_TAG} | tee /tmp/trivy-table-${BUILD_NUMBER}.txt
+          """
+
+          // Scan 2: JSON output for archiving and potential integration
+          sh """
+            trivy image \\
+              --cache-dir /tmp/trivy-cache \\
+              --format json \\
+              --exit-code 0 \\
+              --severity HIGH,CRITICAL \\
+              --no-progress \\
+              --output /tmp/trivy-report-${BUILD_NUMBER}.json \\
+              ${IMAGE_FULL}:${BUILD_TAG}
+          """
+
+          // Archive the JSON report as a Jenkins build artifact
+          archiveArtifacts artifacts: "/tmp/trivy-report-${BUILD_NUMBER}.json", allowEmptyArchive: false
+
+          // Scan 3: Enforcement scan — FAILS the build on CRITICAL findings
+          sh """
+            echo "--- Enforcement scan (fails on ${TRIVY_SEVERITY}) ---"
+            trivy image \\
+              --cache-dir /tmp/trivy-cache \\
+              --format table \\
+              --exit-code ${TRIVY_EXIT_CODE} \\
+              --severity ${TRIVY_SEVERITY} \\
+              --no-progress \\
+              --ignore-unfixed \\
+              ${IMAGE_FULL}:${BUILD_TAG}
+            echo "--- No ${TRIVY_SEVERITY} vulnerabilities found. Proceeding. ---"
+          """
+        }
+      }
+    }
+
+    // STAGE 4: Push to Nexus
+    // Authenticate to Nexus and push both image tags
+    stage('4. Nexus Authentication & Push') {
+      steps {
+        // withCredentials: binds the Jenkins credential to NEXUS_USER and NEXUS_PASS
+        // These variables ONLY exist Locally within this block; Jenkins masks them in logs
+        withCredentials([
+          usernamePassword(
+            credentialsId: "${NEXUS_CRED_ID}",
+            usernameVariable: 'NEXUS_USER',
+            passwordVariable: 'NEXUS_PASS'
+          )
+        ]) {
+          sh """
+            echo "==> Logging in to Nexus Docker registry"
+            
+            echo "${NEXUS_PASS}" | docker login \\
+              --username "${NEXUS_USER}" \\
+              --password-stdin \\
+              ${NEXUS_REGISTRY}
+
+            echo "==> Pushing versioned tag: ${IMAGE_FULL}:${BUILD_TAG}"
+            docker push ${IMAGE_FULL}:${BUILD_TAG}
+
+            echo "==> Pushing latest tag: ${IMAGE_FULL}:latest"
+            docker push ${IMAGE_FULL}:latest
+
+            echo "==> Push complete. Logging out."
+            docker logout ${NEXUS_REGISTRY}
+          """
+        }
+      }
+    }
+
+    // STAGE 5: Deploy to Kubernetes
+    //
+    // Update the Deployment image and trigger a rolling update
+    //1. Check cluster connectivity
+    //2. Ensure namespace exists
+    //3. Update deployment image
+    //4. Add build metadata
+    //5. Wait for rolling update
+    //6. Show pod status
+    //7. Verify deployed image
+    stage('5. Deploy to Kubernetes') {
+      steps {
+        // withKubeConfig: mounts the kubeconfig secret as a temp file,
+        // sets KUBECONFIG env var within the block, then deletes the file after
+        withKubeConfig([credentialsId: "${KUBECONFIG_CRED_ID}"]) {
+          sh """
+            echo "==> Verifying cluster connectivity"
+            kubectl cluster-info --request-timeout=10s
+
+            echo "==> Verifying namespace exists: ${K8S_NAMESPACE}"
+            kubectl get namespace ${K8S_NAMESPACE} || kubectl create namespace ${K8S_NAMESPACE}
+
+            echo "==> Updating deployment image"
+            kubectl set image deployment/${K8S_DEPLOYMENT_NAME} \\
+              ${K8S_DEPLOYMENT_NAME}=${IMAGE_FULL}:${BUILD_TAG} \\
+              --namespace=${K8S_NAMESPACE} \\
+              --record=false
+
+            echo "==> Annotating deployment with build metadata"
+            kubectl annotate deployment/${K8S_DEPLOYMENT_NAME} \\
+              --namespace=${K8S_NAMESPACE} \\
+              --overwrite \\
+              deployment.kubernetes.io/build-number="${BUILD_NUMBER}" \\
+              deployment.kubernetes.io/git-commit="${GIT_COMMIT_SHORT}" \\
+              deployment.kubernetes.io/image-tag="${BUILD_TAG}"
+
+            echo "==> Waiting for rolling update to complete (timeout: 5 minutes)"
+            kubectl rollout status deployment/${K8S_DEPLOYMENT_NAME} \\
+              --namespace=${K8S_NAMESPACE} \\
+              --timeout=300s
+
+            echo "==> Deployment successful. Current pod status:"
+            kubectl get pods \\
+              --namespace=${K8S_NAMESPACE} \\
+              --selector=app=${K8S_DEPLOYMENT_NAME} \\
+              --output=wide
+
+            echo "==> Deployment image verification:"
+            kubectl get deployment/${K8S_DEPLOYMENT_NAME} \\
+              --namespace=${K8S_NAMESPACE} \\
+              --output=jsonpath='{.spec.template.spec.containers[0].image}'
+            echo ""
+          """
+        }
+      }
+    }
+  }
+
+=
+  post {
+
+    // Runs on every completion (success AND failure)
+    always {
+      script {
+        echo "==> Cleaning up local Docker images to reclaim disk space"
+        // Remove the specific build image to prevent disk bloat on the agent
+        sh """
+          docker rmi ${IMAGE_FULL}:${BUILD_TAG} 2>/dev/null || true
+          docker rmi ${IMAGE_FULL}:latest 2>/dev/null || true
+          # Remove dangling (untagged) images from multi-stage builds
+          docker image prune -f 2>/dev/null || true
+        """
+      }
+    }
+
+    success {
+      echo """
+      ╔══════════════════════════════════════════════════════╗
+      ║              PIPELINE SUCCESS                        ║
+      ╠══════════════════════════════════════════════════════╣
+      ║  Build    : ${BUILD_NUMBER}                          ║
+      ║  Image    : ${IMAGE_FULL}:${BUILD_TAG}               ║
+      ║  Deployed : ${K8S_NAMESPACE}/${K8S_DEPLOYMENT_NAME}  ║
+      ╚══════════════════════════════════════════════════════╝
+      """
+    }
+
+    failure {
+      echo """
+      ╔══════════════════════════════════════════════════════╗
+      ║              PIPELINE FAILED                         ║
+      ╠══════════════════════════════════════════════════════╣
+      ║  Build       : ${BUILD_NUMBER}                       ║
+      ║  Check logs above for the failing stage.             ║
+      ║  Kubernetes was NOT updated (deploy stage not run).  ║
+      ╚══════════════════════════════════════════════════════╝
+      """
+    }
+
+    unstable {
+      echo "Build marked UNSTABLE — check test results or scan findings"
+    }
+  }
+}
