@@ -1,0 +1,70 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k8s-obs-app-rules
+  namespace: app-production
+  labels:
+    release: prometheus
+    app: k8s-obs-app
+spec:
+  groups:
+    - name: k8s-obs-app.availability
+      interval: 30s
+      rules:
+        # Alert: Pod is down
+        - alert: AppPodDown
+          expr: |
+            up{job="k8s-obs-app", namespace="app-production"} == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Pod {{ $labels.pod }} is down"
+            description: "{{ $labels.pod }} in {{ $labels.namespace }} has been unreachable for more than 1 minute."
+
+        # Alert: Less than 3 replicas available
+        - alert: AppReplicasMismatch
+          expr: |
+            kube_deployment_spec_replicas{deployment="k8s-obs-app", namespace="app-production"}
+            !=
+            kube_deployment_status_replicas_available{deployment="k8s-obs-app", namespace="app-production"}
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Deployment replica count mismatch"
+            description: "Deployment {{ $labels.deployment }} has {{ $value }} available replicas, expected 3."
+
+    - name: k8s-obs-app.performance
+      rules:
+        # Alert: High error rate
+        - alert: AppHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{namespace="app-production", status_code=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{namespace="app-production"}[5m]))
+            > 0.05
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "High HTTP 5xx error rate"
+            description: "Error rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+        # Alert: High request latency
+        - alert: AppHighLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_request_duration_seconds_bucket{namespace="app-production"}[5m]))
+              by (le, route)
+            ) > 1.0
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "High p95 request latency on {{ $labels.route }}"
+            description: "p95 latency is {{ $value }}s on route {{ $labels.route }}."
