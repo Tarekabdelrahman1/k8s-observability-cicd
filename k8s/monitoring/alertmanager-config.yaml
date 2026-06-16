@@ -1,0 +1,28 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: k8s-obs-app-alerts
+  namespace: app-production
+  labels:
+    release: prometheus
+spec:
+  route:
+    groupWait: 10s
+    groupInterval: 1m
+    repeatInterval: 4h
+    receiver: 'slack-notifications'
+    # تم إزالة توجيه الإيميل بالكامل
+
+  receivers:
+    - name: 'slack-notifications'
+      slackConfigs:
+        - apiURL:
+            name: alertmanager-secrets
+            key: slack-webhook-url
+          channel: '#default'
+          sendResolved: true
+          title: '[{{ .Status | toUpper }}] 🔥 {{ .CommonLabels.alertname }} on {{ .CommonLabels.instance }}'
+          text: >-
+            *Summary:* {{ .CommonAnnotations.summary }}
+            *Description:* {{ .CommonAnnotations.description }}
+            *Severity:* {{ .CommonLabels.severity }}
