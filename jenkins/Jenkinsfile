@@ -297,7 +297,6 @@ pipeline {
     }
   }
 
-=
   post {
 
     // Runs on every completion (success AND failure)
