@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-production
+  labels:
+    # Prometheus Operator uses this label to discover ServiceMonitors in this namespace
+    monitoring: "true"
+    environment: "production"
