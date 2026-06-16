@@ -1,0 +1,35 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: k8s-obs-app
+  namespace: app-production
+  labels:
+    # This label must match the Prometheus Operator's serviceMonitorSelector
+    # Check your Prometheus CR: kubectl get prometheus -A -o yaml | grep serviceMonitorSelector
+    release: prometheus   # Common label when installed via kube-prometheus-stack Helm chart
+    app: k8s-obs-app
+spec:
+  # Which Services in which namespaces to monitor
+  namespaceSelector:
+    matchNames:
+      - app-production
+  # Which Services to monitor (by label)
+  selector:
+    matchLabels:
+      app: k8s-obs-app
+      monitoring: "true"
+  # How to scrape those services
+  endpoints:
+    - port: http          # Must match the port name in the Service (spec.ports[].name)
+      path: /metrics
+      interval: 15s       # Scrape every 15 seconds
+      scrapeTimeout: 10s
+      scheme: http
+      # Optional: rename Prometheus labels for clarity
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
